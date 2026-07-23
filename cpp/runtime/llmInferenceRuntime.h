@@ -208,6 +208,134 @@ public:
         return mDecoderRegistry && mDecoderRegistry->hasSpeculativeDecoder();
     }
 
+    //! Result of runVisionOnly(): the vision encoder's output embedding and per-layer
+    //! deepstack residual features for the request's image(s).
+    struct VisionOnlyResult
+    {
+        bool success{false};
+        Tensor const* outputEmbedding{nullptr}; //!< [numImageTokens, hiddenSize], GPU-resident.
+        OptionalInputTensors deepstackFeatures;  //!< One [numImageTokens, hiddenSize] tensor per deepstack layer.
+    };
+
+    /*!
+     * @brief Run only the vision multimodal encoder for the request's image(s), skipping text
+     * tokenization and M-RoPE generation.
+     *
+     * Reuses MultimodalRunner::preprocess's own native image loading/patchification/RoPE logic
+     * via its existing `imageOnly=true` flag, for host-driven pipelines that assemble
+     * `inputs_embeds` themselves (e.g. a robotics VLA harness injecting an extra modality) and
+     * only need the vision tower's raw output.
+     *
+     * @param request Generation request; only `imageBuffers` on each `Request` is consulted.
+     * @param stream CUDA stream for the vision engine's preprocessing/inference.
+     * @return Result with `success=false` if there is no vision runner loaded, or if
+     *         preprocessing/inference failed. The returned tensors are non-owning views into
+     *         runtime-internal buffers, valid until the next call that uses the vision runner.
+     */
+    VisionOnlyResult runVisionOnly(LLMGenerationRequest const& request, cudaStream_t stream);
+
+    //! Result of runBackboneRawForward(): raw engine outputs for one caller-assembled prefill.
+    struct RawForwardResult
+    {
+        bool success{false};
+        Tensor const* outputLogits{nullptr};
+        Tensor const* outputHiddenStates{nullptr};
+    };
+
+    /*!
+     * @brief Run one independent, one-off prefill forward pass of the base decoder engine given
+     * caller-assembled embeddings, bypassing token-embedding lookup and sampling.
+     *
+     * For a host-driven harness that assembles `inputsEmbeds` itself (text-embedding lookup +
+     * vision-embedding splice + a custom extra modality) and wants raw `hidden_states`/`logits`
+     * back without generation/streaming. Each call resets the base engine's KV cache to empty
+     * first, so calls are mutually independent -- this is a raw-forward escape hatch for one
+     * sequence at a time (batch size must be exactly 1), not an autoregressive decode path.
+     *
+     * @param inputsEmbeds Host tensor, [1, seqLen, hiddenSize], FP32 (cast to the engine's
+     *        activation dtype internally, on the GPU, before the forward pass -- callers should
+     *        NOT pre-cast; passing FP32 directly avoids a scalar host-side cast loop).
+     * @param deepstackEmbeds Host tensors, one per deepstack layer configured on the base
+     *        engine, each [1, seqLen, hiddenSize], FP32 (same internal-cast note as above).
+     *        Pass empty when the request has no image.
+     * @param mropeCosSin Host tensor holding the caller-computed position encoding, in the
+     *        layout `mPipelineIO->mropeCosSin` expects. Ignored for non-MRope base engines.
+     * @param stream CUDA stream for the H2D copies and engine execution.
+     * @return Result with `success=false` on any validation or engine failure. The returned
+     *         tensors are non-owning views into runtime-internal buffers, valid until the next
+     *         call into this runtime.
+     */
+    RawForwardResult runBackboneRawForward(Tensor const& inputsEmbeds, OptionalInputTensors const& deepstackEmbeds,
+        Tensor const& mropeCosSin, cudaStream_t stream);
+
+    //! Result of runFullPreprocessOnly(): the fully-assembled prefill inputs the base decoder
+    //! engine would consume, captured just before mBaseExecutor->prepare/execute.
+    struct FullPreprocessResult
+    {
+        bool success{false};
+        Tensor const* inputsEmbeds{nullptr}; //!< [1, seqLen, hiddenSize], GPU-resident.
+        OptionalInputTensors deepstackEmbeds; //!< One [1, seqLen, hiddenSize] tensor per deepstack layer.
+        Tensor const* mropeCosSin{nullptr};   //!< Position-encoding tensor in the engine's own layout.
+        std::vector<int32_t> idsInput;        //!< Effective (post system-prompt-reuse) token ids, batch size 1.
+    };
+
+    /*!
+     * @brief Run full request preprocessing (chat template, tokenize, vision/audio encode,
+     * M-RoPE, embedding + deepstack assembly) exactly as handleRequest() would, then return
+     * before the base decoder engine actually executes.
+     *
+     * For diffing the engine's own preprocessing against an eager reimplementation: the caller
+     * gets the runtime's real, fully-assembled `inputsEmbeds`/`deepstackEmbeds`/`mropeCosSin`,
+     * which can be fed unmodified into runBackboneRawForward() to isolate the backbone decoder
+     * + M-RoPE from embedding-assembly differences. Batch size must be exactly 1.
+     *
+     * @param request Generation request (image/text as normal).
+     * @param stream CUDA stream for preprocessing.
+     * @return Result with `success=false` on any preprocessing/setup failure. The returned
+     *         tensors are non-owning views into runtime-internal buffers, valid until the next
+     *         call into this runtime.
+     */
+    FullPreprocessResult runFullPreprocessOnly(LLMGenerationRequest const& request, cudaStream_t stream);
+
+    /*!
+     * @brief Overwrite one token position of the just-preprocessed `inputsEmbeds` in place, on
+     * the device -- for injecting a third-modality (e.g. robot-state) embedding that has no slot
+     * in runFullPreprocessOnly()'s own preprocessing.
+     *
+     * Must be called after runFullPreprocessOnly() and before
+     * runBackboneRawForwardFromPreprocessed() (both operate on the same persistent
+     * `mPipelineIO->inputsEmbeds` buffer). Copies only `stateEmbeddingHost`'s `hiddenSize`
+     * elements (H2D + GPU cast) -- NOT a round-trip of the full `[1, seqLen, hiddenSize]` tensor,
+     * which stays device-resident throughout (see runBackboneRawForwardFromPreprocessed()).
+     *
+     * @param position Token index to overwrite, in [0, seqLen).
+     * @param stateEmbeddingHost Host tensor, [hiddenSize], FP32.
+     * @param stream CUDA stream.
+     * @return false if `position` is out of range or the shapes don't match.
+     */
+    bool injectStateEmbedding(int32_t position, Tensor const& stateEmbeddingHost, cudaStream_t stream);
+
+    /*!
+     * @brief Like runBackboneRawForward(), but consumes `mPipelineIO->inputsEmbeds` /
+     * `deepstackEmbeds` / `mropeCosSin` as already populated by a preceding
+     * runFullPreprocessOnly() (+ optional injectStateEmbedding()) call, instead of taking them as
+     * parameters to copy in -- skips the host round-trip for these tensors entirely (the caller
+     * would otherwise need to pull them out as numpy, patch one token host-side, and copy the
+     * whole tensor back in, which is exactly the redundant device->host->device hop this avoids).
+     *
+     * Restricted to this runtime's actual current preprocessing state: unlike
+     * runBackboneRawForward() (which takes an explicit possibly-empty `deepstackEmbeds`), this
+     * assumes deepstack features are real whenever `mPipelineIO->deepstackEmbeds` is non-empty --
+     * correct for a vision-always caller (e.g. a robot with cameras on every request), not a
+     * general text-or-vision request mix.
+     *
+     * @param stream CUDA stream for engine execution.
+     * @return Result with `success=false` on any validation or engine failure. The returned
+     *         tensors are non-owning views into runtime-internal buffers, valid until the next
+     *         call into this runtime.
+     */
+    RawForwardResult runBackboneRawForwardFromPreprocessed(cudaStream_t stream);
+
 private:
     //! @brief Common initialization logic shared between both constructors
     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
@@ -231,6 +359,14 @@ private:
     std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     std::unique_ptr<PipelineIO> mPipelineIO;           //!< Per-pipeline I/O tensors
+    // FP32 device scratch for runBackboneRawForward()'s H2D-then-GPU-cast path (caller-supplied
+    // inputsEmbeds/deepstackEmbeds arrive as FP32; cast to the engine's FP16 activation dtype on
+    // the GPU instead of a scalar host-side loop). Reused/grown across calls.
+    rt::Tensor mRawForwardInputsEmbedsFp32Scratch{};
+    std::vector<rt::Tensor> mRawForwardDeepstackFp32Scratch;
+    // FP32 device scratch for injectStateEmbedding() -- a single [hiddenSize] row, not a full
+    // [1, seqLen, hiddenSize] tensor.
+    rt::Tensor mStateEmbeddingFp32Scratch{};
     TensorMap mBaseTensorMap;                          //!< Base engine binding map
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;

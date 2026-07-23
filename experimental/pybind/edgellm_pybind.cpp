@@ -27,6 +27,7 @@
 #include "common/tensor.h"
 #include "common/trtUtils.h"
 #include "profiling/metrics.h"
+#include "kernels/typeCast/halfToFloatCast.h"
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
@@ -99,6 +100,149 @@ private:
     cudaStream_t mStream{nullptr};
 };
 
+//! Convert a device- or host-resident FP16/FP32 Tensor into a float32 numpy array, synchronizing
+//! `stream` first when the source is device-resident. Used by the raw-forward/vision-only entry
+//! points, which hand back whatever dtype the internal pipeline buffer happens to use (FP16 for
+//! embeddings/hidden_states, FP32 for logits/mrope) as one consistent Python-facing dtype.
+//! Converts `tensor` (device- or host-resident, FP16 or FP32) to a freshly allocated FP32 numpy
+//! array. Two perf-critical design points, both confirmed via profiling (comparing this pipeline's
+//! end-to-end latency against `llm_bench`'s direct engine-only benchmark on the identical engine
+//! and input size, which showed ~3x less time -- ~23ms vs ~72ms -- pointing squarely at this
+//! function as the source of the gap):
+//!   1. The device-to-host copy stages through a persistent, reused, PINNED host buffer instead of
+//!      a fresh `std::vector` -- unpinned host memory forces cudaMemcpyAsync to fall back to a
+//!      synchronous staged copy internally (same issue as numpyFloat32ToHostHalfTensorInto()).
+//!   2. For FP16 device tensors (e.g. a [1, 487, 2560] hidden_states -- ~1.25M elements), the
+//!      half->float cast runs as a GPU kernel (castHalfToFloatDevice) BEFORE the device-to-host
+//!      copy, so the transferred bytes are already FP32. The previous implementation copied the
+//!      raw FP16 bytes to host first, then converted with a scalar, single-threaded
+//!      `__half2float` loop over every element on the CPU -- measured as the dominant cost for
+//!      this call.
+py::array_t<float> tensorToNumpyFloat32(Tensor const& tensor, cudaStream_t stream)
+{
+    Coords const shape = tensor.getShape();
+    std::vector<ssize_t> npShape;
+    npShape.reserve(static_cast<size_t>(shape.getNumDims()));
+    for (int32_t d = 0; d < shape.getNumDims(); ++d)
+    {
+        npShape.push_back(static_cast<ssize_t>(shape[d]));
+    }
+    int64_t const volume = shape.volume();
+    py::array_t<float> out(npShape);
+
+    // Persistent pinned-host staging buffer for the final device-to-host copy, reused/grown
+    // across calls regardless of which caller (runVisionOnly / runBackboneRawForward /
+    // runFullPreprocessOnly) or tensor (embeddings / deepstack / hidden_states / logits) is being
+    // converted -- each call fully copies the staged data into its own freshly allocated `out`
+    // before returning, so reuse across distinct tensors/callers is safe.
+    static Tensor hostStagingBuffer;
+    Coords const floatShape(std::vector<int64_t>{volume});
+    if (!hostStagingBuffer.reshape(floatShape))
+    {
+        hostStagingBuffer
+            = Tensor(floatShape, DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "tensorToNumpyFloat32::hostStaging");
+    }
+    float* hostBuf = hostStagingBuffer.dataPointer<float>();
+
+    if (tensor.getDataType() == nvinfer1::DataType::kFLOAT)
+    {
+        if (tensor.getDeviceType() == DeviceType::kGPU)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(
+                hostBuf, tensor.rawPointer(), static_cast<size_t>(volume) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        else
+        {
+            std::memcpy(hostBuf, tensor.rawPointer(), static_cast<size_t>(volume) * sizeof(float));
+        }
+    }
+    else if (tensor.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        if (tensor.getDeviceType() == DeviceType::kGPU)
+        {
+            static Tensor deviceCastBuffer;
+            if (!deviceCastBuffer.reshape(floatShape))
+            {
+                deviceCastBuffer = Tensor(
+                    floatShape, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "tensorToNumpyFloat32::deviceCast");
+            }
+            kernel::castHalfToFloatDevice(deviceCastBuffer.dataPointer<float>(),
+                reinterpret_cast<half const*>(tensor.rawPointer()), volume, stream);
+            CUDA_CHECK(cudaMemcpyAsync(hostBuf, deviceCastBuffer.rawPointer(),
+                static_cast<size_t>(volume) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        else
+        {
+            // CPU-resident half tensor: no device to run the cast kernel on. Not currently
+            // exercised by any runVisionOnly/runBackboneRawForward/runFullPreprocessOnly caller.
+            half const* halfSrc = reinterpret_cast<half const*>(tensor.rawPointer());
+            for (int64_t i = 0; i < volume; ++i)
+            {
+                hostBuf[i] = __half2float(halfSrc[i]);
+            }
+        }
+    }
+    else
+    {
+        throw std::runtime_error("tensorToNumpyFloat32: unsupported tensor dtype (only FP16/FP32 supported)");
+    }
+    std::memcpy(out.mutable_data(), hostBuf, static_cast<size_t>(volume) * sizeof(float));
+    return out;
+}
+
+//! Copy a caller-supplied FP32 numpy array (mrope_cos_sin) into `buffer` -- a persistent,
+//! caller-owned, PINNED host FP32 Tensor reused across calls. Deliberately NOT zero-copy: the
+//! subsequent cudaMemcpyAsync(..., HostToDevice, ...) in runBackboneRawForward() needs pinned
+//! source memory to actually run asynchronously -- copying from ordinary (non-pinned) numpy-owned
+//! host memory forces the CUDA driver to fall back to a synchronous staged copy, which blocks the
+//! calling CPU thread for the full transfer duration (confirmed via nsys: cudaMemcpyAsync total
+//! time dropped from ~200ms to low milliseconds across 8 forward passes after switching this call
+//! site to a pinned buffer).
+void numpyFloat32ToHostFloatTensorInto(
+    Tensor& buffer, py::array_t<float, py::array::c_style | py::array::forcecast> const& arr)
+{
+    std::vector<int64_t> dims;
+    dims.reserve(static_cast<size_t>(arr.ndim()));
+    for (ssize_t d = 0; d < arr.ndim(); ++d)
+    {
+        dims.push_back(arr.shape(d));
+    }
+    Coords const shape(dims);
+    if (!buffer.reshape(shape))
+    {
+        buffer = Tensor(shape, DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "numpyFloat32ToHostFloatTensor");
+    }
+    std::memcpy(buffer.dataPointer<float>(), arr.data(), static_cast<size_t>(shape.volume()) * sizeof(float));
+}
+
+//! Python-facing result of PyLLMRuntime::runVisionOnly().
+struct PyVisionOnlyResult
+{
+    bool success{false};
+    py::array_t<float> outputEmbedding;
+    std::vector<py::array_t<float>> deepstackFeatures;
+};
+
+//! Python-facing result of PyLLMRuntime::runBackboneRawForward().
+struct PyRawForwardResult
+{
+    bool success{false};
+    py::array_t<float> logits;
+    py::array_t<float> hiddenStates;
+};
+
+//! Python-facing result of PyLLMRuntime::runFullPreprocessOnly().
+struct PyFullPreprocessResult
+{
+    bool success{false};
+    py::array_t<float> inputsEmbeds;
+    std::vector<py::array_t<float>> deepstackEmbeds;
+    py::array_t<float> mropeCosSin;
+    std::vector<int32_t> idsInput;
+};
+
 //! Unified Python wrapper for LLMInferenceRuntime.
 //! Supports both vanilla decoding (no draft model) and Eagle speculative decoding
 //! through constructor overloading — mirrors the C++ unified runtime.
@@ -132,9 +276,146 @@ public:
         return response;
     }
 
+    //! Run only the vision encoder for `request`'s image(s), skipping text tokenization/M-RoPE.
+    //! Returns the output embedding and per-layer deepstack features as float32 numpy arrays, for
+    //! host-side embedding assembly ahead of runBackboneRawForward().
+    PyVisionOnlyResult runVisionOnly(LLMGenerationRequest const& request)
+    {
+        auto const result = mRuntime->runVisionOnly(request, mStream.get());
+        PyVisionOnlyResult pyResult;
+        pyResult.success = result.success;
+        if (!result.success)
+        {
+            return pyResult;
+        }
+        pyResult.outputEmbedding = tensorToNumpyFloat32(*result.outputEmbedding, mStream.get());
+        pyResult.deepstackFeatures.reserve(result.deepstackFeatures.size());
+        for (auto const& feature : result.deepstackFeatures)
+        {
+            pyResult.deepstackFeatures.push_back(tensorToNumpyFloat32(feature.get(), mStream.get()));
+        }
+        return pyResult;
+    }
+
+    //! Run one independent prefill forward pass of the base decoder engine over a caller-assembled
+    //! `inputs_embeds` [1, seq, hidden] (+ optional per-layer `deepstack_embeds`, `mrope_cos_sin]),
+    //! bypassing embedding lookup/sampling entirely. Returns raw logits/hidden_states as float32
+    //! numpy arrays. All three inputs are plain float32 numpy; fp32->fp16 casting for the engine's
+    //! actual fp16 embedding buffers happens inside this wrapper, not in the caller.
+    PyRawForwardResult runBackboneRawForward(
+        py::array_t<float, py::array::c_style | py::array::forcecast> const& inputsEmbeds,
+        std::vector<py::array_t<float, py::array::c_style | py::array::forcecast>> const& deepstackEmbeds,
+        py::array_t<float, py::array::c_style | py::array::forcecast> const& mropeCosSin)
+    {
+        // Reused, persistent pinned-host FP32 staging buffers (grow-if-needed) instead of
+        // allocating a fresh Tensor per call. Deliberately NOT cast to FP16 here: passed through
+        // as FP32, runBackboneRawForward() does the H2D copy + FP32->FP16 cast itself on the GPU
+        // (see LLMInferenceRuntime::runBackboneRawForward) -- avoids a scalar host-side
+        // __float2half loop that was measured as a multi-ms bottleneck for a ~1.25M-element
+        // [1, ~500, 2560] embedding tensor.
+        numpyFloat32ToHostFloatTensorInto(mHostInputsEmbedsBuffer, inputsEmbeds);
+
+        if (mHostDeepstackBuffers.size() != deepstackEmbeds.size())
+        {
+            mHostDeepstackBuffers.resize(deepstackEmbeds.size());
+        }
+        OptionalInputTensors deepstackRefs;
+        deepstackRefs.reserve(deepstackEmbeds.size());
+        for (size_t i = 0; i < deepstackEmbeds.size(); ++i)
+        {
+            numpyFloat32ToHostFloatTensorInto(mHostDeepstackBuffers[i], deepstackEmbeds[i]);
+            deepstackRefs.emplace_back(std::cref(mHostDeepstackBuffers[i]));
+        }
+
+        numpyFloat32ToHostFloatTensorInto(mHostMropeCosSinBuffer, mropeCosSin);
+
+        auto const result = mRuntime->runBackboneRawForward(
+            mHostInputsEmbedsBuffer, deepstackRefs, mHostMropeCosSinBuffer, mStream.get());
+
+        PyRawForwardResult pyResult;
+        pyResult.success = result.success;
+        if (!result.success)
+        {
+            return pyResult;
+        }
+        pyResult.logits = tensorToNumpyFloat32(*result.outputLogits, mStream.get());
+        pyResult.hiddenStates = tensorToNumpyFloat32(*result.outputHiddenStates, mStream.get());
+        return pyResult;
+    }
+
+    //! Run full request preprocessing (chat template, tokenize, vision/audio encode, M-RoPE,
+    //! embedding + deepstack assembly) exactly as handle_request() would, then return before the
+    //! base decoder engine actually executes. For diffing the engine's own preprocessing against
+    //! an eager reimplementation: feed the returned inputs_embeds/deepstack_embeds/mrope_cos_sin
+    //! straight into run_backbone_raw_forward() to isolate the backbone decoder from
+    //! embedding-assembly differences.
+    PyFullPreprocessResult runFullPreprocessOnly(LLMGenerationRequest const& request)
+    {
+        auto const result = mRuntime->runFullPreprocessOnly(request, mStream.get());
+        PyFullPreprocessResult pyResult;
+        pyResult.success = result.success;
+        if (!result.success)
+        {
+            return pyResult;
+        }
+        pyResult.inputsEmbeds = tensorToNumpyFloat32(*result.inputsEmbeds, mStream.get());
+        pyResult.deepstackEmbeds.reserve(result.deepstackEmbeds.size());
+        for (auto const& feature : result.deepstackEmbeds)
+        {
+            pyResult.deepstackEmbeds.push_back(tensorToNumpyFloat32(feature.get(), mStream.get()));
+        }
+        pyResult.mropeCosSin = tensorToNumpyFloat32(*result.mropeCosSin, mStream.get());
+        pyResult.idsInput = result.idsInput;
+        return pyResult;
+    }
+
     bool captureDecodingCudaGraph()
     {
         return mRuntime->captureDecodingCUDAGraph(mStream.get());
+    }
+
+    //! Like runFullPreprocessOnly(), but for the device-resident fast path: returns only
+    //! `ids_input` (tiny, needed on host to locate a special token's position) and leaves
+    //! inputs_embeds/deepstack_embeds/mrope_cos_sin on the device, un-converted -- pair with
+    //! inject_state_embedding() + run_backbone_raw_forward_from_preprocessed() to avoid the
+    //! device->host->device round-trip run_full_preprocess_only() +
+    //! run_backbone_raw_forward() would otherwise require for a caller that only needs to patch
+    //! one token's embedding (e.g. injecting a third-modality/robot-state embedding that has no
+    //! slot in the engine's own preprocessing).
+    std::pair<bool, std::vector<int32_t>> runFullPreprocessOnlyDeviceResident(LLMGenerationRequest const& request)
+    {
+        auto const result = mRuntime->runFullPreprocessOnly(request, mStream.get());
+        return {result.success, result.idsInput};
+    }
+
+    //! Overwrite one token position of the just-preprocessed inputs_embeds in place, on the
+    //! device. Must follow run_full_preprocess_only_device_resident() and precede
+    //! run_backbone_raw_forward_from_preprocessed(). `state_embedding` is a small
+    //! `[hidden_size]` FP32 host array (e.g. the robot-state projector's output) -- NOT the full
+    //! `[1, seq, hidden]` embedding tensor.
+    bool injectStateEmbedding(int32_t position, py::array_t<float, py::array::c_style | py::array::forcecast> const& stateEmbedding)
+    {
+        numpyFloat32ToHostFloatTensorInto(mHostStateEmbeddingBuffer, stateEmbedding);
+        return mRuntime->injectStateEmbedding(position, mHostStateEmbeddingBuffer, mStream.get());
+    }
+
+    //! Like run_backbone_raw_forward(), but consumes inputs_embeds/deepstack_embeds/mrope_cos_sin
+    //! as already populated by a preceding run_full_preprocess_only_device_resident() (+ optional
+    //! inject_state_embedding()) -- no host round-trip for these tensors. See
+    //! LLMInferenceRuntime::runBackboneRawForwardFromPreprocessed() for the vision-always
+    //! restriction this relies on.
+    PyRawForwardResult runBackboneRawForwardFromPreprocessed()
+    {
+        auto const result = mRuntime->runBackboneRawForwardFromPreprocessed(mStream.get());
+        PyRawForwardResult pyResult;
+        pyResult.success = result.success;
+        if (!result.success)
+        {
+            return pyResult;
+        }
+        pyResult.logits = tensorToNumpyFloat32(*result.outputLogits, mStream.get());
+        pyResult.hiddenStates = tensorToNumpyFloat32(*result.outputHiddenStates, mStream.get());
+        return pyResult;
     }
 
     bool saveSystemPromptKVCache(std::string const& prompt, std::string const& loraWeightsName)
@@ -171,6 +452,14 @@ private:
     CudaStreamWrapper mStream;
     std::unique_ptr<LLMInferenceRuntime> mRuntime;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
+
+    // Persistent pinned-host staging buffers for runBackboneRawForward(), reused across calls
+    // (grown via move-assignment only when a larger shape is requested) -- see
+    // numpyFloat32ToHostFloatTensorInto().
+    Tensor mHostInputsEmbedsBuffer;
+    std::vector<Tensor> mHostDeepstackBuffers;
+    Tensor mHostMropeCosSinBuffer;
+    Tensor mHostStateEmbeddingBuffer; //!< For injectStateEmbedding() -- a single [hiddenSize] row.
 };
 
 imageUtils::ImageData loadImageFromPath(std::string const& path)
@@ -428,6 +717,26 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts)
         .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons);
 
+    py::class_<PyVisionOnlyResult>(m, "VisionOnlyResult")
+        .def(py::init<>())
+        .def_readonly("success", &PyVisionOnlyResult::success)
+        .def_readonly("output_embedding", &PyVisionOnlyResult::outputEmbedding)
+        .def_readonly("deepstack_features", &PyVisionOnlyResult::deepstackFeatures);
+
+    py::class_<PyRawForwardResult>(m, "RawForwardResult")
+        .def(py::init<>())
+        .def_readonly("success", &PyRawForwardResult::success)
+        .def_readonly("logits", &PyRawForwardResult::logits)
+        .def_readonly("hidden_states", &PyRawForwardResult::hiddenStates);
+
+    py::class_<PyFullPreprocessResult>(m, "FullPreprocessResult")
+        .def(py::init<>())
+        .def_readonly("success", &PyFullPreprocessResult::success)
+        .def_readonly("inputs_embeds", &PyFullPreprocessResult::inputsEmbeds)
+        .def_readonly("deepstack_embeds", &PyFullPreprocessResult::deepstackEmbeds)
+        .def_readonly("mrope_cos_sin", &PyFullPreprocessResult::mropeCosSin)
+        .def_readonly("ids_input", &PyFullPreprocessResult::idsInput);
+
     // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)
     // ========================================================================
@@ -444,6 +753,32 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             "Construct for Eagle speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
+        .def("run_vision_only", &PyLLMRuntime::runVisionOnly, py::arg("request"),
+            "Run only the vision encoder for a request's image(s) (skips text tokenization/M-RoPE); "
+            "returns output_embedding + per-layer deepstack_features as float32 numpy arrays")
+        .def("run_backbone_raw_forward", &PyLLMRuntime::runBackboneRawForward, py::arg("inputs_embeds"),
+            py::arg("deepstack_embeds"), py::arg("mrope_cos_sin"),
+            "Run one independent prefill forward pass of the base decoder engine given a caller-assembled "
+            "inputs_embeds [1, seq, hidden] (+ optional deepstack_embeds, mrope_cos_sin), bypassing embedding "
+            "lookup/sampling. Returns raw logits/hidden_states as float32 numpy arrays")
+        .def("run_full_preprocess_only", &PyLLMRuntime::runFullPreprocessOnly, py::arg("request"),
+            "Run full request preprocessing (chat template, tokenize, vision/audio encode, M-RoPE, embedding + "
+            "deepstack assembly) exactly as handle_request() would, returning before the base decoder engine "
+            "executes -- for diffing against an eager reimplementation")
+        .def("run_full_preprocess_only_device_resident", &PyLLMRuntime::runFullPreprocessOnlyDeviceResident,
+            py::arg("request"),
+            "Like run_full_preprocess_only(), but leaves inputs_embeds/deepstack_embeds/mrope_cos_sin "
+            "device-resident (returns only ids_input) -- pair with inject_state_embedding() + "
+            "run_backbone_raw_forward_from_preprocessed() to avoid a host round-trip when only one token's "
+            "embedding needs patching")
+        .def("inject_state_embedding", &PyLLMRuntime::injectStateEmbedding, py::arg("position"),
+            py::arg("state_embedding"),
+            "Overwrite one token position of the just-preprocessed inputs_embeds in place, on the device. "
+            "state_embedding is [hidden_size] FP32, not the full [1, seq, hidden] tensor")
+        .def("run_backbone_raw_forward_from_preprocessed", &PyLLMRuntime::runBackboneRawForwardFromPreprocessed,
+            "Like run_backbone_raw_forward(), but consumes inputs_embeds/deepstack_embeds/mrope_cos_sin as "
+            "already populated by run_full_preprocess_only_device_resident() (+ optional "
+            "inject_state_embedding()) -- no host round-trip for these tensors")
         .def("capture_decoding_cuda_graph", &PyLLMRuntime::captureDecodingCudaGraph,
             "Capture CUDA graphs for optimized decoding")
         .def("save_system_prompt_kv_cache", &PyLLMRuntime::saveSystemPromptKVCache, py::arg("prompt"),

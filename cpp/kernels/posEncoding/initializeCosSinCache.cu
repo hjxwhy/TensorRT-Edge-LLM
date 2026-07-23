@@ -28,6 +28,23 @@ namespace trt_edgellm
 namespace kernel
 {
 
+namespace
+{
+//! Cached SM count for device 0 -- avoids a fresh cudaGetDeviceProperties() driver round-trip
+//! (~1.7ms, measured) in every initialize*RopeCosSin() call; multiProcessorCount never changes
+//! for a fixed GPU during a process's lifetime. Same pattern as
+//! kernels/contextAttentionKernels/contextFMHARunner.cpp's ContextFMHARunner constructor cache.
+int32_t getCachedNumSMs()
+{
+    static int32_t numSMs = [] {
+        cudaDeviceProp deviceProp;
+        CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
+        return deviceProp.multiProcessorCount;
+    }();
+    return numSMs;
+}
+} // namespace
+
 template <int32_t RotaryDim>
 __global__ void initializeNormalRopeCosSinKernel(
     float* cosSinCache, float rotaryBaseFrequency, float rotaryScale, int32_t rotaryEmbeddingMaxPositions)
@@ -162,9 +179,7 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
     // (e.g., 32 threads × 8 iterations = 256 dims for rotaryDim=512).
     dim3 block = useHalfWarpKernel ? dim3(16, 8) : dim3(32, 4);
 
-    cudaDeviceProp deviceProp;
-    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
-    int32_t const numSMs = deviceProp.multiProcessorCount;
+    int32_t const numSMs = getCachedNumSMs();
 
     void* kernelPtr{nullptr};
     switch (rotaryDim)
@@ -291,9 +306,7 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
     // Each CTA get assigned 128 threads.
     dim3 block(16, 8);
 
-    cudaDeviceProp deviceProp;
-    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
-    int32_t const numSMs = deviceProp.multiProcessorCount;
+    int32_t const numSMs = getCachedNumSMs();
 
     void* kernelPtr{nullptr};
     switch (rotaryDim)
@@ -454,9 +467,7 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     // Each CTA get assigned 128 threads.
     dim3 block(8, 16);
 
-    cudaDeviceProp deviceProp;
-    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
-    int32_t const numSMs = deviceProp.multiProcessorCount;
+    int32_t const numSMs = getCachedNumSMs();
 
     void* kernelPtr{nullptr};
     switch (rotaryDim)

@@ -22,12 +22,8 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "torch==2.12.0",
-    "transformers==5.9.0",
-    "onnx==1.19.0",
-    "onnxscript==0.7.0",
+    "onnxscript==0.7.1",
     "safetensors==0.7.0",
-    "numpy==2.4.6",
     "onnx-graphsurgeon==0.6.1",
 ]
 
@@ -41,7 +37,6 @@ tools = [
     "soundfile==0.13.1",
     "librosa==0.11.0",
     "tiktoken==0.13.0",
-    "torchvision==0.27.0",
     "backoff",
 ]
 server = [

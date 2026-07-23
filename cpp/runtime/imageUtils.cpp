@@ -83,22 +83,38 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     unsigned char* imageData = stbi_load_from_memory(data, size, &width, &height, &channels, desiredChannels);
     ELLM_CHECK(imageData != nullptr, "Failed to load image from memory: " + std::string(stbi_failure_reason()));
 
-    rt::Tensor imgTensor{};
-    // Need to handle the logic where space allocation for image tensor failed. We need to free the image data and
-    // throw an exception.
-    try
+    // Pool of persistent, reused pinned-host buffers instead of a fresh cudaMallocHost/cudaFreeHost
+    // pair per call (measured as a real cost: this function is called once per camera image, every
+    // request). Sized well above any realistic simultaneous-image count per request; slots cycle
+    // round-robin, each reshaped (grown via move-assignment only if needed) rather than
+    // reallocated. Each call returns a NON-OWNING Tensor view into its slot -- safe because the
+    // pool itself has static storage duration (outlives any ImageData returned from a single
+    // request-processing pass) and slots aren't revisited within the small number of calls one
+    // request makes.
+    constexpr size_t kPoolSize = 16;
+    static std::vector<rt::Tensor> sPool(kPoolSize);
+    static size_t sNextSlot = 0;
+    rt::Tensor& slot = sPool[sNextSlot];
+    sNextSlot = (sNextSlot + 1) % kPoolSize;
+
+    Coords const shape({height, width, desiredChannels});
+    if (!slot.reshape(shape))
     {
-        imgTensor = rt::Tensor({height, width, desiredChannels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-            "imageUtils::loadImageFromMemory::imgTensor");
+        try
+        {
+            slot = rt::Tensor(shape, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+                "imageUtils::loadImageFromMemory::pool");
+        }
+        catch (std::exception const& e)
+        {
+            stbi_image_free(imageData);
+            throw std::runtime_error("Failed to allocate space for image tensor: " + std::string(e.what()));
+        }
     }
-    catch (std::exception const& e)
-    {
-        stbi_image_free(imageData);
-        throw std::runtime_error("Failed to allocate space for image tensor: " + std::string(e.what()));
-    }
-    memcpy(imgTensor.dataPointer<unsigned char>(), imageData, width * height * desiredChannels);
+    memcpy(slot.dataPointer<unsigned char>(), imageData, width * height * desiredChannels);
     stbi_image_free(imageData);
-    return ImageData(std::move(imgTensor));
+    return ImageData(rt::Tensor(
+        slot.dataPointer<unsigned char>(), shape, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "imageUtils::loadImageFromMemory::view"));
 }
 
 void resizeImage(

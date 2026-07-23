@@ -25,6 +25,7 @@
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/speculative/batchEvictKernels.h"
+#include "kernels/typeCast/halfToFloatCast.h"
 #include "multimodal/multimodalRunner.h"
 #include "multimodal/qwenViTRunner.h"
 #include "profiling/nvtx_wrapper.h"
@@ -1262,6 +1263,375 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     }
     emitTokenCallbacks(context);
     return true;
+}
+
+LLMInferenceRuntime::VisionOnlyResult LLMInferenceRuntime::runVisionOnly(
+    LLMGenerationRequest const& request, cudaStream_t stream)
+{
+    VisionOnlyResult result;
+    if (!mVisionRunner)
+    {
+        LOG_ERROR("runVisionOnly() called but this runtime has no vision runner loaded.");
+        return result;
+    }
+
+    std::vector<std::vector<int32_t>> batchedInputIds; // Unused: text tokenization is skipped when imageOnly=true.
+    if (!mVisionRunner->preprocess(
+            request, batchedInputIds, mTokenizer.get(), /*mropeCosSinOut=*/std::nullopt, stream, /*imageOnly=*/true))
+    {
+        LOG_ERROR("runVisionOnly(): vision preprocessing failed.");
+        return result;
+    }
+    if (!mVisionRunner->infer(stream))
+    {
+        LOG_ERROR("runVisionOnly(): vision inference failed.");
+        return result;
+    }
+
+    result.success = true;
+    result.outputEmbedding = &mVisionRunner->getOutputEmbedding();
+    result.deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+    return result;
+}
+
+LLMInferenceRuntime::RawForwardResult LLMInferenceRuntime::runBackboneRawForward(Tensor const& inputsEmbeds,
+    OptionalInputTensors const& deepstackEmbeds, Tensor const& mropeCosSin, cudaStream_t stream)
+{
+    RawForwardResult result;
+
+    Coords const embShape = inputsEmbeds.getShape();
+    if (embShape.getNumDims() != 3 || embShape[0] != 1)
+    {
+        LOG_ERROR("runBackboneRawForward(): inputsEmbeds must be [1, seqLen, hiddenSize].");
+        return result;
+    }
+    int32_t const activeBatchSize = 1;
+    int32_t const inputIdsLength = static_cast<int32_t>(embShape[1]);
+    int32_t const hiddenSize = static_cast<int32_t>(embShape[2]);
+    if (hiddenSize != mDeployment.base.hiddenSize)
+    {
+        LOG_ERROR("runBackboneRawForward(): inputsEmbeds hiddenSize %d does not match engine hiddenSize %d.",
+            hiddenSize, mDeployment.base.hiddenSize);
+        return result;
+    }
+    if (inputIdsLength > mDeployment.base.maxSupportedInputLength)
+    {
+        LOG_ERROR("runBackboneRawForward(): seqLen %d exceeds engine max supported input length %d.",
+            inputIdsLength, mDeployment.base.maxSupportedInputLength);
+        return result;
+    }
+
+    // Reshape IO tensors for this one-off step (mirrors runBaseModelPrefill's setup, minus the
+    // embedding lookup: the caller has already assembled inputsEmbeds/deepstackEmbeds on the host).
+    check::check(mPipelineIO->inputsEmbeds.reshape({activeBatchSize, inputIdsLength, hiddenSize}),
+        "Tensor reshape failed");
+    check::check(mPipelineIO->outputLogits.reshape({activeBatchSize, mDeployment.base.outputVocabSize}),
+        "Tensor reshape failed");
+    check::check(mPipelineIO->hostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+
+    // Caller-supplied inputsEmbeds/deepstackEmbeds are FP32 host tensors: H2D-copy the raw bytes
+    // into an FP32 device scratch buffer, then cast to the engine's FP16 activation dtype with a
+    // GPU kernel -- avoids a scalar host-side __float2half loop (measured as a multi-ms bottleneck
+    // for a [1, ~500, 2560] embedding tensor when done that way).
+    Coords const embVolumeShape({static_cast<int64_t>(inputIdsLength) * hiddenSize});
+    if (!mRawForwardInputsEmbedsFp32Scratch.reshape(embVolumeShape))
+    {
+        mRawForwardInputsEmbedsFp32Scratch = Tensor(embVolumeShape, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+            "LLMInferenceRuntime::mRawForwardInputsEmbedsFp32Scratch");
+    }
+    size_t const embBytes = static_cast<size_t>(inputIdsLength) * hiddenSize * sizeof(float);
+    CUDA_CHECK(cudaMemcpyAsync(mRawForwardInputsEmbedsFp32Scratch.rawPointer(), inputsEmbeds.rawPointer(), embBytes,
+        cudaMemcpyHostToDevice, stream));
+    kernel::castFloatToHalfDevice(mPipelineIO->inputsEmbeds.dataPointer<half>(),
+        mRawForwardInputsEmbedsFp32Scratch.dataPointer<float>(),
+        static_cast<int64_t>(inputIdsLength) * hiddenSize, stream);
+
+
+    bool const hasDeepstack = !deepstackEmbeds.empty();
+    if (hasDeepstack)
+    {
+        if (deepstackEmbeds.size() != mPipelineIO->deepstackEmbeds.size())
+        {
+            LOG_ERROR("runBackboneRawForward(): expected %zu deepstack tensors for this engine, got %zu.",
+                mPipelineIO->deepstackEmbeds.size(), deepstackEmbeds.size());
+            return result;
+        }
+        if (mRawForwardDeepstackFp32Scratch.size() != deepstackEmbeds.size())
+        {
+            mRawForwardDeepstackFp32Scratch.resize(deepstackEmbeds.size());
+        }
+        for (size_t i = 0; i < deepstackEmbeds.size(); ++i)
+        {
+            Tensor const& src = deepstackEmbeds[i].get();
+            check::check(mPipelineIO->deepstackEmbeds[i].reshape({activeBatchSize, inputIdsLength, hiddenSize}),
+                "Tensor reshape failed");
+            Coords const dsVolumeShape({static_cast<int64_t>(inputIdsLength) * hiddenSize});
+            if (!mRawForwardDeepstackFp32Scratch[i].reshape(dsVolumeShape))
+            {
+                mRawForwardDeepstackFp32Scratch[i] = Tensor(dsVolumeShape, DeviceType::kGPU,
+                    nvinfer1::DataType::kFLOAT, "LLMInferenceRuntime::mRawForwardDeepstackFp32Scratch");
+            }
+            size_t const dsBytes = static_cast<size_t>(inputIdsLength) * hiddenSize * sizeof(float);
+            CUDA_CHECK(cudaMemcpyAsync(mRawForwardDeepstackFp32Scratch[i].rawPointer(), src.rawPointer(), dsBytes,
+                cudaMemcpyHostToDevice, stream));
+            kernel::castFloatToHalfDevice(mPipelineIO->deepstackEmbeds[i].dataPointer<half>(),
+                mRawForwardDeepstackFp32Scratch[i].dataPointer<float>(),
+                static_cast<int64_t>(inputIdsLength) * hiddenSize, stream);
+        }
+    }
+
+    if (mDeployment.base.ropeConfig.type == RopeType::kMRope)
+    {
+        Coords const ropeShape = mropeCosSin.getShape();
+        check::check(mPipelineIO->mropeCosSin.reshape(ropeShape), "Tensor reshape failed");
+        size_t const ropeBytes
+            = static_cast<size_t>(ropeShape.volume()) * rt::utils::getTypeSize(mropeCosSin.getDataType());
+        CUDA_CHECK(cudaMemcpyAsync(
+            mPipelineIO->mropeCosSin.rawPointer(), mropeCosSin.rawPointer(), ropeBytes, cudaMemcpyHostToDevice, stream));
+    }
+
+    // Reset the base KV cache to empty so this call is fully independent of any prior one --
+    // this is a one-off prefill, not a step in an autoregressive decode sequence.
+    check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    std::fill(mHostReuseKVCacheLengths.dataPointer<int32_t>(),
+        mHostReuseKVCacheLengths.dataPointer<int32_t>() + activeBatchSize, 0);
+    mSharedResources->cacheManagers[0]->resetForNewSequences(mHostReuseKVCacheLengths, stream);
+
+    int32_t* hostCtxLenData = mPipelineIO->hostContextLengths.dataPointer<int32_t>();
+    hostCtxLenData[0] = inputIdsLength;
+
+    mStepPreparer->prepare(
+        InferencePhase::kPrefill, activeBatchSize, *mSharedResources->cacheManagers[0], *mPipelineIO, stream);
+
+    if (mDeepstack)
+    {
+        if (hasDeepstack)
+        {
+            mDeepstack->useRealFeatures(mBaseTensorMap);
+        }
+        else
+        {
+            mDeepstack->useZeroTarget(mBaseTensorMap);
+        }
+    }
+
+    bool const baseKVAllEmpty = mSharedResources->cacheManagers[0]->getKVCacheAllEmpty();
+    auto const prefillDims = mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
+
+    if (!mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, stream))
+    {
+        LOG_ERROR("runBackboneRawForward(): failed to prepare base model for raw forward.");
+        return result;
+    }
+    if (!mBaseExecutor->execute(stream))
+    {
+        LOG_ERROR("runBackboneRawForward(): failed to execute base model for raw forward.");
+        return result;
+    }
+    mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, stream);
+
+    check::check(mPipelineIO->outputHiddenStates.reshape({activeBatchSize, inputIdsLength, hiddenSize}),
+        "Tensor reshape failed");
+
+    result.success = true;
+    result.outputLogits = &mPipelineIO->outputLogits;
+    result.outputHiddenStates = &mPipelineIO->outputHiddenStates;
+    return result;
+}
+
+bool LLMInferenceRuntime::injectStateEmbedding(
+    int32_t position, Tensor const& stateEmbeddingHost, cudaStream_t stream)
+{
+    Coords const embShape = mPipelineIO->inputsEmbeds.getShape();
+    if (embShape.getNumDims() != 3 || embShape[0] != 1)
+    {
+        LOG_ERROR("injectStateEmbedding(): inputsEmbeds is not [1, seqLen, hiddenSize] -- call "
+                   "runFullPreprocessOnly() first.");
+        return false;
+    }
+    int32_t const seqLen = static_cast<int32_t>(embShape[1]);
+    int32_t const hiddenSize = static_cast<int32_t>(embShape[2]);
+    if (position < 0 || position >= seqLen)
+    {
+        LOG_ERROR("injectStateEmbedding(): position %d out of range [0, %d).", position, seqLen);
+        return false;
+    }
+    if (stateEmbeddingHost.getShape().volume() != hiddenSize)
+    {
+        LOG_ERROR("injectStateEmbedding(): stateEmbeddingHost has %ld elements, expected hiddenSize=%d.",
+            stateEmbeddingHost.getShape().volume(), hiddenSize);
+        return false;
+    }
+
+    Coords const stateShape({static_cast<int64_t>(hiddenSize)});
+    if (!mStateEmbeddingFp32Scratch.reshape(stateShape))
+    {
+        mStateEmbeddingFp32Scratch = Tensor(
+            stateShape, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "LLMInferenceRuntime::mStateEmbeddingFp32Scratch");
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mStateEmbeddingFp32Scratch.rawPointer(), stateEmbeddingHost.rawPointer(),
+        static_cast<size_t>(hiddenSize) * sizeof(float), cudaMemcpyHostToDevice, stream));
+    half* const rowDst = mPipelineIO->inputsEmbeds.dataPointer<half>() + static_cast<int64_t>(position) * hiddenSize;
+    kernel::castFloatToHalfDevice(rowDst, mStateEmbeddingFp32Scratch.dataPointer<float>(), hiddenSize, stream);
+    return true;
+}
+
+LLMInferenceRuntime::RawForwardResult LLMInferenceRuntime::runBackboneRawForwardFromPreprocessed(cudaStream_t stream)
+{
+    RawForwardResult result;
+
+    Coords const embShape = mPipelineIO->inputsEmbeds.getShape();
+    if (embShape.getNumDims() != 3 || embShape[0] != 1)
+    {
+        LOG_ERROR("runBackboneRawForwardFromPreprocessed(): inputsEmbeds is not [1, seqLen, hiddenSize] -- call "
+                   "runFullPreprocessOnly() first.");
+        return result;
+    }
+    int32_t const activeBatchSize = 1;
+    int32_t const inputIdsLength = static_cast<int32_t>(embShape[1]);
+    int32_t const hiddenSize = static_cast<int32_t>(embShape[2]);
+
+    check::check(mPipelineIO->outputLogits.reshape({activeBatchSize, mDeployment.base.outputVocabSize}),
+        "Tensor reshape failed");
+    check::check(mPipelineIO->hostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+
+    // No copy-in: inputsEmbeds/deepstackEmbeds/mropeCosSin are already correctly populated
+    // on-device by the preceding runFullPreprocessOnly() (+ optional injectStateEmbedding()) call
+    // -- that is the whole point of this variant vs. runBackboneRawForward().
+
+    check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    std::fill(mHostReuseKVCacheLengths.dataPointer<int32_t>(),
+        mHostReuseKVCacheLengths.dataPointer<int32_t>() + activeBatchSize, 0);
+    mSharedResources->cacheManagers[0]->resetForNewSequences(mHostReuseKVCacheLengths, stream);
+
+    int32_t* hostCtxLenData = mPipelineIO->hostContextLengths.dataPointer<int32_t>();
+    hostCtxLenData[0] = inputIdsLength;
+
+    mStepPreparer->prepare(
+        InferencePhase::kPrefill, activeBatchSize, *mSharedResources->cacheManagers[0], *mPipelineIO, stream);
+
+    // Restricted to a vision-always caller (see header docstring): treats a non-empty
+    // mPipelineIO->deepstackEmbeds as real deepstack features, unconditionally.
+    bool const hasDeepstack = !mPipelineIO->deepstackEmbeds.empty();
+    if (mDeepstack)
+    {
+        if (hasDeepstack)
+        {
+            mDeepstack->useRealFeatures(mBaseTensorMap);
+        }
+        else
+        {
+            mDeepstack->useZeroTarget(mBaseTensorMap);
+        }
+    }
+
+    bool const baseKVAllEmpty = mSharedResources->cacheManagers[0]->getKVCacheAllEmpty();
+    auto const prefillDims = mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
+
+    if (!mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, stream))
+    {
+        LOG_ERROR("runBackboneRawForwardFromPreprocessed(): failed to prepare base model for raw forward.");
+        return result;
+    }
+    if (!mBaseExecutor->execute(stream))
+    {
+        LOG_ERROR("runBackboneRawForwardFromPreprocessed(): failed to execute base model for raw forward.");
+        return result;
+    }
+    mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, stream);
+
+    check::check(mPipelineIO->outputHiddenStates.reshape({activeBatchSize, inputIdsLength, hiddenSize}),
+        "Tensor reshape failed");
+
+    result.success = true;
+    result.outputLogits = &mPipelineIO->outputLogits;
+    result.outputHiddenStates = &mPipelineIO->outputHiddenStates;
+    return result;
+}
+
+LLMInferenceRuntime::FullPreprocessResult LLMInferenceRuntime::runFullPreprocessOnly(
+    LLMGenerationRequest const& request, cudaStream_t stream)
+{
+    FullPreprocessResult result;
+
+    int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
+    if (activeBatchSize != 1)
+    {
+        LOG_ERROR("runFullPreprocessOnly(): batch size must be exactly 1, got %d.", activeBatchSize);
+        return result;
+    }
+
+    // Mirrors handleRequest()'s preprocessing prefix (chat template -> multimodal preprocess ->
+    // prefill setup) verbatim, stopping just before runBaseModelPrefill() would call
+    // mBaseExecutor->prepare/execute.
+    request.formattedRequests.resize(activeBatchSize);
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
+            request.addGenerationPrompt, request.enableThinking);
+    }
+
+    DecodingInferenceContext context;
+    context.initialize(
+        activeBatchSize, /*maxGenLength=*/1, std::nullopt, rt::OptionalInputTensors{}, request.loraWeightsName, stream);
+
+    bool const supportsMultimodalInput
+        = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
+    if (supportsMultimodalInput)
+    {
+        if (!multiModalRuntimePreprocess(request, context, stream))
+        {
+            LOG_ERROR("runFullPreprocessOnly(): multimodal preprocessing failed.");
+            return result;
+        }
+    }
+    else
+    {
+        context.systemPrompts[0] = request.formattedRequests[0].formattedSystemPrompt;
+        context.rawBatchedInputIds.emplace_back(
+            mTokenizer->encode(request.formattedRequests[0].formattedCompleteRequest, false));
+        if (context.rawBatchedInputIds[0].empty())
+        {
+            LOG_ERROR("runFullPreprocessOnly(): failed to tokenize input text.");
+            return result;
+        }
+    }
+
+    DecodingStrategy& decodingStrategy = mDecoderRegistry->select(request);
+    if (!setUpForPrefillExecution(context, decodingStrategy))
+    {
+        LOG_ERROR("runFullPreprocessOnly(): prefill execution setup failed.");
+        return result;
+    }
+
+    // Lifted verbatim from runBaseModelPrefill()'s token-packing + embedding-assembly lines
+    // (up to but excluding mBaseExecutor->prepare/execute), specialized to batch size 1.
+    int32_t const inputIdsLength = context.effectivePrefillLengths[0];
+    check::check(mIdsInput.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+    check::check(mPipelineIO->inputsEmbeds.reshape({activeBatchSize, inputIdsLength, mDeployment.base.hiddenSize}),
+        "Tensor reshape failed");
+
+    check::check(mHostPackedTokenIds.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+    int32_t* hostPackedTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
+    std::fill(hostPackedTokenIdsData, hostPackedTokenIdsData + activeBatchSize * inputIdsLength, 0);
+    std::copy(context.tokenIds[0].begin(), context.tokenIds[0].end(), hostPackedTokenIdsData);
+
+    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), hostPackedTokenIdsData,
+        activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    mEmbeddingPre->embed(mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, stream);
+    mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, stream);
+
+    result.success = true;
+    result.inputsEmbeds = &mPipelineIO->inputsEmbeds;
+    result.deepstackEmbeds.reserve(mPipelineIO->deepstackEmbeds.size());
+    for (auto const& feature : mPipelineIO->deepstackEmbeds)
+    {
+        result.deepstackEmbeds.emplace_back(std::cref(feature));
+    }
+    result.mropeCosSin = &mPipelineIO->mropeCosSin;
+    result.idsInput = context.tokenIds[0];
+    return result;
 }
 
 bool LLMInferenceRuntime::captureBaseGraphWithLoraFanout(InferenceDims const& dims, cudaStream_t stream)
