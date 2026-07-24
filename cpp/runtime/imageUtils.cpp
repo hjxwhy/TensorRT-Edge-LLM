@@ -75,6 +75,36 @@ ImageData loadImageFromFile(std::string const& path)
     return ImageData(std::move(imgTensor));
 }
 
+namespace
+{
+//! Copy `height*width*channels` bytes of raw RGB pixels into a persistent, reused pinned-host
+//! buffer and return a NON-OWNING Tensor view into it. Backing pool of pinned buffers instead of a
+//! fresh cudaMallocHost/cudaFreeHost pair per call (measured as a real cost: image loading happens
+//! once per camera image, every request). Sized well above any realistic simultaneous-image count
+//! per request; slots cycle round-robin, each reshaped (grown via move-assignment only if needed)
+//! rather than reallocated. Safe because the pool itself has static storage duration (outlives any
+//! ImageData returned from a single request-processing pass) and slots aren't revisited within the
+//! small number of calls one request makes. Shared by loadImageFromMemory (post-decode) and
+//! loadImageFromRaw (already-decoded caller pixels).
+rt::Tensor copyIntoPooledImageSlot(unsigned char const* src, int64_t height, int64_t width, int64_t channels)
+{
+    constexpr size_t kPoolSize = 16;
+    static std::vector<rt::Tensor> sPool(kPoolSize);
+    static size_t sNextSlot = 0;
+    rt::Tensor& slot = sPool[sNextSlot];
+    sNextSlot = (sNextSlot + 1) % kPoolSize;
+
+    Coords const shape({height, width, channels});
+    if (!slot.reshape(shape))
+    {
+        slot = rt::Tensor(shape, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "imageUtils::pooledImageSlot");
+    }
+    memcpy(slot.dataPointer<unsigned char>(), src, width * height * channels);
+    return rt::Tensor(
+        slot.dataPointer<unsigned char>(), shape, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "imageUtils::pooledImageSlot::view");
+}
+} // namespace
+
 ImageData loadImageFromMemory(unsigned char const* data, size_t size)
 {
     int width{0}, height{0}, channels{0};
@@ -83,38 +113,18 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     unsigned char* imageData = stbi_load_from_memory(data, size, &width, &height, &channels, desiredChannels);
     ELLM_CHECK(imageData != nullptr, "Failed to load image from memory: " + std::string(stbi_failure_reason()));
 
-    // Pool of persistent, reused pinned-host buffers instead of a fresh cudaMallocHost/cudaFreeHost
-    // pair per call (measured as a real cost: this function is called once per camera image, every
-    // request). Sized well above any realistic simultaneous-image count per request; slots cycle
-    // round-robin, each reshaped (grown via move-assignment only if needed) rather than
-    // reallocated. Each call returns a NON-OWNING Tensor view into its slot -- safe because the
-    // pool itself has static storage duration (outlives any ImageData returned from a single
-    // request-processing pass) and slots aren't revisited within the small number of calls one
-    // request makes.
-    constexpr size_t kPoolSize = 16;
-    static std::vector<rt::Tensor> sPool(kPoolSize);
-    static size_t sNextSlot = 0;
-    rt::Tensor& slot = sPool[sNextSlot];
-    sNextSlot = (sNextSlot + 1) % kPoolSize;
-
-    Coords const shape({height, width, desiredChannels});
-    if (!slot.reshape(shape))
-    {
-        try
-        {
-            slot = rt::Tensor(shape, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-                "imageUtils::loadImageFromMemory::pool");
-        }
-        catch (std::exception const& e)
-        {
-            stbi_image_free(imageData);
-            throw std::runtime_error("Failed to allocate space for image tensor: " + std::string(e.what()));
-        }
-    }
-    memcpy(slot.dataPointer<unsigned char>(), imageData, width * height * desiredChannels);
+    ImageData result(copyIntoPooledImageSlot(imageData, height, width, desiredChannels));
     stbi_image_free(imageData);
-    return ImageData(rt::Tensor(
-        slot.dataPointer<unsigned char>(), shape, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "imageUtils::loadImageFromMemory::view"));
+    return result;
+}
+
+ImageData loadImageFromRaw(unsigned char const* data, int64_t height, int64_t width, int64_t channels)
+{
+    // Already-decoded RGB pixels (e.g. from a serving path that has the frame in memory already):
+    // skip stbi entirely and hand the bytes straight to the pooled-slot copy. Avoids the pure-waste
+    // JPEG encode->decode round-trip a caller would otherwise pay just to reach loadImageFromMemory.
+    ELLM_CHECK(channels == 3, "loadImageFromRaw only supports 3-channel (RGB) images");
+    return ImageData(copyIntoPooledImageSlot(data, height, width, channels));
 }
 
 void resizeImage(

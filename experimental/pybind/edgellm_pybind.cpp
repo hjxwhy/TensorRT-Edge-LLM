@@ -473,6 +473,17 @@ imageUtils::ImageData loadImageFromBytes(py::bytes const& data)
     return imageUtils::loadImageFromMemory(reinterpret_cast<unsigned char const*>(dataStr.data()), dataStr.size());
 }
 
+//! \brief Build an ImageData from already-decoded raw pixels: an (H, W, 3) uint8 RGB numpy array.
+//! Skips the image codec entirely, for callers (e.g. the serving path) that already hold the frame
+//! decoded in memory and would otherwise pay a pure-waste encode->decode round-trip.
+imageUtils::ImageData loadImageFromArray(py::array_t<uint8_t, py::array::c_style | py::array::forcecast> const& arr)
+{
+    auto buf = arr.request();
+    ELLM_CHECK(buf.ndim == 3 && buf.shape[2] == 3, "load_image_from_array expects an (H, W, 3) uint8 RGB array");
+    return imageUtils::loadImageFromRaw(
+        static_cast<unsigned char const*>(buf.ptr), buf.shape[0], buf.shape[1], buf.shape[2]);
+}
+
 //! \brief Build an AudioData from raw encoded audio bytes (wav / mp3 / flac).
 //! Decodes via vendored miniaudio (16 kHz mono FP32) and hands raw PCM off to
 //! the runner; mel extraction happens inside the audio runner per its
@@ -578,6 +589,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
 
     m.def("load_image_from_path", &loadImageFromPath, py::arg("path"), "Load image from file path");
     m.def("load_image_from_bytes", &loadImageFromBytes, py::arg("data"), "Load image from bytes");
+    m.def("load_image_from_array", &loadImageFromArray, py::arg("array"),
+        "Build ImageData from a raw (H,W,3) uint8 RGB numpy array (no decode)");
 
     // ========================================================================
     // Audio utilities

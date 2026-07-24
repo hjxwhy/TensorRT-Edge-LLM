@@ -77,6 +77,17 @@ ImageData loadImageFromFile(std::string const& path);
  */
 ImageData loadImageFromMemory(unsigned char const* data, size_t size);
 
+/*!
+ * @brief Build image data from already-decoded raw RGB pixels (no image codec involved)
+ * @param data Pointer to tightly-packed [height, width, channels] UINT8 RGB pixels
+ * @param height Image height
+ * @param width Image width
+ * @param channels Number of channels (must be 3)
+ * @return Loaded image data
+ * @throws std::runtime_error if channels != 3, or memory allocation fails
+ */
+ImageData loadImageFromRaw(unsigned char const* data, int64_t height, int64_t width, int64_t channels);
+
 //! @brief Interpolation filter for :func:`resizeImage`.
 enum class InterpolationMode
 {
