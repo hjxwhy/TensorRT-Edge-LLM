@@ -329,8 +329,15 @@ public:
 
         numpyFloat32ToHostFloatTensorInto(mHostMropeCosSinBuffer, mropeCosSin);
 
-        auto const result = mRuntime->runBackboneRawForward(
-            mHostInputsEmbedsBuffer, deepstackRefs, mHostMropeCosSinBuffer, mStream.get());
+        // Release the GIL for the engine forward (pure C++/CUDA, touches no Python objects) so the
+        // server's control-loop / asyncio threads keep running during this ~30-80ms call. Reacquire
+        // before tensorToNumpyFloat32(), which allocates numpy arrays and needs the GIL.
+        auto const result = [&]
+        {
+            py::gil_scoped_release release;
+            return mRuntime->runBackboneRawForward(
+                mHostInputsEmbedsBuffer, deepstackRefs, mHostMropeCosSinBuffer, mStream.get());
+        }();
 
         PyRawForwardResult pyResult;
         pyResult.success = result.success;
@@ -384,7 +391,14 @@ public:
     //! slot in the engine's own preprocessing).
     std::pair<bool, std::vector<int32_t>> runFullPreprocessOnlyDeviceResident(LLMGenerationRequest const& request)
     {
-        auto const result = mRuntime->runFullPreprocessOnly(request, mStream.get());
+        // Chat-template/tokenize/vision-encode/M-RoPE/embedding-assembly (~13-20ms) is pure
+        // C++/CUDA; release the GIL so the server's control/asyncio threads keep running. The
+        // returned idsInput is a plain std::vector (marshalled to Python after reacquire).
+        auto const result = [&]
+        {
+            py::gil_scoped_release release;
+            return mRuntime->runFullPreprocessOnly(request, mStream.get());
+        }();
         return {result.success, result.idsInput};
     }
 
@@ -406,7 +420,14 @@ public:
     //! restriction this relies on.
     PyRawForwardResult runBackboneRawForwardFromPreprocessed()
     {
-        auto const result = mRuntime->runBackboneRawForwardFromPreprocessed(mStream.get());
+        // GIL released for the engine forward (pure C++/CUDA); reacquired for the numpy marshalling
+        // below (tensorToNumpyFloat32 allocates Python arrays). Lets the server's control/asyncio
+        // threads run during this ~30ms call instead of stalling on the held GIL.
+        auto const result = [&]
+        {
+            py::gil_scoped_release release;
+            return mRuntime->runBackboneRawForwardFromPreprocessed(mStream.get());
+        }();
         PyRawForwardResult pyResult;
         pyResult.success = result.success;
         if (!result.success)

@@ -461,10 +461,22 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
             if (doResize)
             {
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
-                rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(mResizedImageHost, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize,
-                    maxSeqLen, stream);
+                if (resizedHeight == image.height && resizedWidth == image.width)
+                {
+                    // Image is already at the ViT's patch-aligned target grid (e.g. a serving path
+                    // that pre-resizes to getResizedImageSize's output): the bicubic resizeImage()
+                    // would be an identity, and it is a single-threaded CPU hotspot (~13ms, worse
+                    // under thread contention). Skip straight to formatPatch on the original.
+                    formatPatch(image, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize,
+                        maxSeqLen, stream);
+                }
+                else
+                {
+                    rt::imageUtils::resizeImage(
+                        image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
+                    formatPatch(mResizedImageHost, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize,
+                        maxSeqLen, stream);
+                }
             }
             else
             {
